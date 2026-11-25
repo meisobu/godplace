@@ -28,7 +28,7 @@ import java.io.FileReader;
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
 
-@Mod(modid = "godplace", name = "GodPlace", version = "1.0", clientSideOnly = true)
+@Mod(modid = "godplacefast", name = "GodPlace", version = "1.0", clientSideOnly = true)
 public class FastPlaceMod {
 
     public static boolean enabled = false;
