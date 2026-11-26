@@ -1,7 +1,6 @@
 package com.beast.godplace;
 
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.entity.EntityPlayerSP;
 import net.minecraft.client.settings.KeyBinding;
 import net.minecraft.command.CommandBase;
 import net.minecraft.command.ICommandSender;
@@ -28,14 +27,12 @@ import java.io.FileReader;
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
 
-@Mod(modid = "godplacefast", name = "GodPlace", version = "1.1", clientSideOnly = true)
+@Mod(modid = "godplacefast", name = "GodPlace", version = "1.0", clientSideOnly = true)
 public class FastPlaceMod {
 
     public static boolean enabled = false;
-    public static int placementDelay = 0;   // delay normal (depois do 1o bloco)
-    public static int startDelay = 1;       // delay so no 1o bloco de cada vez que segura o botao direito
+    public static int delayHalfTicks = 0; // 0..6  =  0, 0.5, 1, 1.5, 2, 2.5, 3
     public static String activationMode = "toggle";
-    public static boolean alertsEnabled = true;
     public static boolean debugMode = false;
 
     private final Minecraft mc = Minecraft.getMinecraft();
@@ -49,12 +46,11 @@ public class FastPlaceMod {
     private boolean locked = false;
     private EnumFacing lockedFace = null;
 
-    private boolean wasKeyPressed = false;
     public static KeyBinding godPlaceKeyBind;
 
     private int internalDelayCounter = 0;
-    private String lastMode = "toggle";
-    private int placementsThisHold = 0;
+    private int currentGapTicks = 1;
+    private boolean gapFlip = false;
 
     @EventHandler
     public void init(FMLInitializationEvent event) {
@@ -102,12 +98,10 @@ public class FastPlaceMod {
         }
 
         handleKeybind();
-
         if (!enabled) {
             locked = false;
             lockedFace = null;
             internalDelayCounter = 0;
-            placementsThisHold = 0;
             return;
         }
 
@@ -118,57 +112,39 @@ public class FastPlaceMod {
         }
 
         // Reset lock on RMB release
-        if (!mc.gameSettings.keyBindUseItem.isKeyDown()) {
-            placementsThisHold = 0;
-            if (locked) {
-                locked = false;
-                lockedFace = null;
-            }
+        if (!mc.gameSettings.keyBindUseItem.isKeyDown() && locked) {
+            locked = false;
+            lockedFace = null;
         }
     }
 
     private void handleKeybind() {
-        boolean isKeyDown = godPlaceKeyBind.isKeyDown();
-
-        if (!activationMode.equalsIgnoreCase(lastMode)) {
-            enabled = false;
-            wasKeyPressed = false;
-            lastMode = activationMode;
-        }
-
         if ("toggle".equalsIgnoreCase(activationMode)) {
             if (godPlaceKeyBind.isPressed()) {
                 enabled = !enabled;
-                sendAlert(enabled ? "ON (delay: " + startDelay + " -> " + placementDelay + ")" : "OFF");
             }
         } else {
-            if (isKeyDown && !wasKeyPressed) {
-                sendAlert("ON (hold mode)");
-                wasKeyPressed = true;
-            }
-            enabled = isKeyDown;
-            if (!isKeyDown && wasKeyPressed) {
-                sendAlert("OFF");
-                wasKeyPressed = false;
-            }
+            enabled = godPlaceKeyBind.isKeyDown();
         }
     }
 
-    // 1o bloco: usa startDelay. Do 2o em diante: usa placementDelay.
-    private int currentDelay() {
-        return placementsThisHold <= 1 ? startDelay : placementDelay;
+    // Ticks de espera ate a proxima colocacao: delay 0 = 1 tick, delay 3 = 4 ticks (igual ao vanilla).
+    // Delays com .5 alternam entre dois valores, entao a media fica no meio.
+    private int nextGapTicks() {
+        int gapHalf = delayHalfTicks + 2;
+        int gap = gapHalf / 2;
+        if (gapHalf % 2 == 1) {
+            if (gapFlip) gap++;
+            gapFlip = !gapFlip;
+        }
+        return gap;
     }
 
     private void manageDelayWithField() {
         try {
-            int d = currentDelay();
-            if (d == 0) {
-                rightClickDelayField.setInt(mc, 0);
-            } else {
-                int current = rightClickDelayField.getInt(mc);
-                if (current > d) {
-                    rightClickDelayField.setInt(mc, d);
-                }
+            int current = rightClickDelayField.getInt(mc);
+            if (current > currentGapTicks) {
+                rightClickDelayField.setInt(mc, currentGapTicks);
             }
         } catch (Exception e) {
             System.err.println("[GodPlace] Delay field error: " + e.getMessage());
@@ -201,24 +177,18 @@ public class FastPlaceMod {
             }
         }
 
-        // Fallback sem reflexao: cooldown real entre colocacoes
         if (rightClickDelayField == null && internalDelayCounter > 0) {
             event.setCanceled(true);
             return;
         }
 
-        if (placementsThisHold < 2) placementsThisHold++;
+        currentGapTicks = nextGapTicks();
         if (rightClickDelayField == null) {
-            internalDelayCounter = currentDelay();
+            internalDelayCounter = currentGapTicks;
         }
     }
 
     // ==================== CHAT MESSAGES ====================
-    private void sendAlert(String msg) {
-        if (!alertsEnabled || mc.thePlayer == null) return;
-        mc.thePlayer.addChatMessage(new ChatComponentText("[GodPlace] " + msg));
-    }
-
     private void sendDebug(String msg) {
         if (!debugMode || mc.thePlayer == null) return;
         mc.thePlayer.addChatMessage(new ChatComponentText("\u00a78[GP-DEBUG] \u00a77" + msg));
@@ -246,10 +216,8 @@ public class FastPlaceMod {
                 String key = parts[0].trim();
                 String value = parts[1].trim();
                 switch (key) {
-                    case "placementDelay": placementDelay = parseDelay(value); break;
-                    case "startDelay": startDelay = parseDelay(value); break;
-                    case "activationMode": activationMode = "hold".equalsIgnoreCase(value) ? "hold" : "toggle"; break;
-                    case "alertsEnabled": alertsEnabled = Boolean.parseBoolean(value); break;
+                    case "placementDelay": delayHalfTicks = parseDelayHalf(value); break;
+                    case "activationMode": activationMode = value; break;
                     case "debugMode": debugMode = Boolean.parseBoolean(value); break;
                 }
             }
@@ -258,13 +226,18 @@ public class FastPlaceMod {
         }
     }
 
-    private static int parseDelay(String value) {
+    private static int parseDelayHalf(String value) {
         try {
-            int d = Integer.parseInt(value);
-            return Math.max(0, Math.min(5, d));
+            double d = Double.parseDouble(value.replace(',', '.'));
+            int half = (int) Math.round(d * 2);
+            return Math.max(0, Math.min(6, half));
         } catch (NumberFormatException e) {
             return 0;
         }
+    }
+
+    public static String delayText(int half) {
+        return (half % 2 == 0) ? String.valueOf(half / 2) : (half / 2) + ".5";
     }
 
     public static void saveSettings() {
@@ -278,10 +251,8 @@ public class FastPlaceMod {
         }
         try (BufferedWriter writer = new BufferedWriter(new FileWriter(configFile))) {
             writer.write("# GodPlace Config\n");
-            writer.write("placementDelay=" + placementDelay + "\n");
-            writer.write("startDelay=" + startDelay + "\n");
+            writer.write("placementDelay=" + delayText(delayHalfTicks) + "\n");
             writer.write("activationMode=" + activationMode + "\n");
-            writer.write("alertsEnabled=" + alertsEnabled + "\n");
             writer.write("debugMode=" + debugMode + "\n");
             writer.flush();
         } catch (Exception e) {}
@@ -290,85 +261,35 @@ public class FastPlaceMod {
     // ==================== COMMAND ====================
     public static class GodPlaceCommand extends CommandBase {
         @Override public String getCommandName() { return "gp"; }
-        @Override public String getCommandUsage(ICommandSender s) { return "/gp [toggle|start|delay|mode|alert|debug|about]"; }
+        @Override public String getCommandUsage(ICommandSender s) { return "/gp [delay|mode|debug]"; }
         @Override public java.util.List<String> getCommandAliases() { return Arrays.asList("godplace"); }
         @Override public boolean canCommandSenderUseCommand(ICommandSender s) { return true; }
-
-        private static String onOff(boolean b) { return b ? "ON" : "OFF"; }
-
-        private static String keyName() {
-            try {
-                return Keyboard.getKeyName(godPlaceKeyBind.getKeyCode());
-            } catch (Exception e) {
-                return "?";
-            }
-        }
-
-        private static void sendStatus(ICommandSender sender) {
-            String[] lines = {
-                "------- GodPlace -------",
-                "Status: " + onOff(enabled),
-                "Delay start: " + startDelay + "  (1o bloco)",
-                "Delay: " + placementDelay + "  (2o bloco em diante)",
-                "Modo: " + activationMode + "  (tecla " + keyName() + ")",
-                "Face lock: " + onOff(enabled),
-                "Alertas: " + onOff(alertsEnabled),
-                "Debug: " + onOff(debugMode),
-                "Comandos: toggle, start, delay, mode, alert, debug, about",
-                "------------------------"
-            };
-            for (String line : lines) {
-                sender.addChatMessage(new ChatComponentText(line));
-            }
-        }
 
         @Override
         public void processCommand(ICommandSender sender, String[] args) {
             if (args.length == 0) {
-                sendStatus(sender);
+                enabled = !enabled;
+                sender.addChatMessage(new ChatComponentText(
+                    enabled ? "[GodPlace] \u00a7aON \u00a77(delay: " + delayText(delayHalfTicks) + ")" : "[GodPlace] \u00a7cOFF"
+                ));
                 return;
             }
 
             String cmd = args[0].toLowerCase();
 
-            if ("toggle".equals(cmd) || "on".equals(cmd) || "off".equals(cmd)) {
-                if ("hold".equalsIgnoreCase(activationMode)) {
-                    sender.addChatMessage(new ChatComponentText("[GodPlace] Modo hold: segure a tecla " + keyName() + " para usar."));
-                } else {
-                    enabled = "toggle".equals(cmd) ? !enabled : "on".equals(cmd);
-                    sender.addChatMessage(new ChatComponentText(
-                        enabled ? "[GodPlace] ON (delay: " + startDelay + " -> " + placementDelay + ")" : "[GodPlace] OFF"
-                    ));
-                }
-            }
-
-            else if ("delay".equals(cmd) && args.length > 1) {
+            if ("delay".equals(cmd) && args.length > 1) {
                 try {
-                    int d = Integer.parseInt(args[1]);
-                    if (d >= 0 && d <= 5) {
-                        placementDelay = d;
-                        sender.addChatMessage(new ChatComponentText("[GodPlace] Delay (do 2o bloco em diante): " + d));
+                    double d = Double.parseDouble(args[1].replace(',', '.'));
+                    int half = (int) Math.round(d * 2);
+                    if (Math.abs(d * 2 - half) < 1e-9 && half >= 0 && half <= 6) {
+                        delayHalfTicks = half;
+                        sender.addChatMessage(new ChatComponentText("[GodPlace] \u00a7fDelay: \u00a7e" + delayText(half)));
                         saveSettings();
                     } else {
-                        sender.addChatMessage(new ChatComponentText("\u00a7c0-5 only"));
+                        sender.addChatMessage(new ChatComponentText("\u00a7c0, 0.5, 1, 1.5, 2, 2.5 ou 3"));
                     }
                 } catch (Exception e) {
-                    sender.addChatMessage(new ChatComponentText("\u00a7c/gp delay <0-5>"));
-                }
-            }
-
-            else if ("start".equals(cmd) && args.length > 1) {
-                try {
-                    int d = Integer.parseInt(args[1]);
-                    if (d >= 0 && d <= 5) {
-                        startDelay = d;
-                        sender.addChatMessage(new ChatComponentText("[GodPlace] Delay do 1o bloco: " + d));
-                        saveSettings();
-                    } else {
-                        sender.addChatMessage(new ChatComponentText("\u00a7c0-5 only"));
-                    }
-                } catch (Exception e) {
-                    sender.addChatMessage(new ChatComponentText("\u00a7c/gp start <0-5>"));
+                    sender.addChatMessage(new ChatComponentText("\u00a7c/gp delay <0-3>  (de 0.5 em 0.5)"));
                 }
             }
 
@@ -376,19 +297,11 @@ public class FastPlaceMod {
                 String m = args[1].toLowerCase();
                 if ("hold".equals(m) || "toggle".equals(m)) {
                     activationMode = m;
-                    sender.addChatMessage(new ChatComponentText("[GodPlace] Mode: " + m));
+                    sender.addChatMessage(new ChatComponentText("[GodPlace] \u00a7fMode: \u00a7e" + m));
                     saveSettings();
                 } else {
                     sender.addChatMessage(new ChatComponentText("\u00a7chold or toggle"));
                 }
-            }
-
-            else if ("alert".equals(cmd)) {
-                alertsEnabled = !alertsEnabled;
-                sender.addChatMessage(new ChatComponentText(
-                    "[GodPlace] Alerts: " + (alertsEnabled ? "ON" : "OFF")
-                ));
-                saveSettings();
             }
 
             else if ("debug".equals(cmd)) {
@@ -401,13 +314,13 @@ public class FastPlaceMod {
 
             else if ("about".equals(cmd)) {
                 sender.addChatMessage(new ChatComponentText(
-                    "[GodPlace] A mod designed to help with block placements made by sheep :3"
+                    "[GodPlace] \u00a7fA mod designed to help with block placements made by sheep :3"
                 ));
             }
 
             else {
                 sender.addChatMessage(new ChatComponentText(
-                    "[GodPlace] /gp, toggle, start, delay, mode, alert, debug, about"
+                    "[GodPlace] \u00a7f/gp, delay, mode, debug, about"
                 ));
             }
         }
