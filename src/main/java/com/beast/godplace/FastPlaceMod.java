@@ -26,7 +26,7 @@ import java.io.FileWriter;
 import java.lang.reflect.Field;
 import java.util.List;
 
-@Mod(modid = "godplace", name = "GodPlace", version = "1.0", clientSideOnly = true)
+@Mod(modid = "godplacefast", name = "GodPlace", version = "1.0", clientSideOnly = true)
 public class FastPlaceMod {
 
     public static boolean enabled = false;
