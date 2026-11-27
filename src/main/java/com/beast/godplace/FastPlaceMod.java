@@ -20,7 +20,6 @@ import net.minecraftforge.fml.client.registry.ClientRegistry;
 import org.lwjgl.input.Keyboard;
 
 import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.io.File;
 import java.io.FileWriter;
@@ -28,13 +27,14 @@ import java.io.FileReader;
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
 
-@Mod(modid = "godplacefast", name = "GodPlace", version = "1.1", clientSideOnly = true)
+@Mod(modid = "godplacefast", name = "GodPlace", version = "1.0", clientSideOnly = true)
 public class FastPlaceMod {
 
     public static boolean enabled = false;
     public static int delayHalfTicks = 0; // 0..6  =  0, 0.5, 1, 1.5, 2, 2.5, 3
     public static String activationMode = "toggle";
     public static boolean debugMode = false;
+    public static boolean voidUnlock = true; // desativa a trava de face quando ha void abaixo
 
     private final Minecraft mc = Minecraft.getMinecraft();
 
@@ -42,24 +42,17 @@ public class FastPlaceMod {
     private static final String CONFIG_FOLDER = "godplace";
     private static final String CONFIG_FILE_NAME = "settings.cfg";
 
-    // Minimo entre duas tentativas feitas pelo retry por frame (evita spam de pacotes)
-    private static final long FRAME_RETRY_MIN_NANOS = 15000000L; // 15 ms
-
     private Field rightClickDelayField;
-    private Method rightClickMethod;
 
     private boolean locked = false;
     private EnumFacing lockedFace = null;
+    private boolean voidBelow = false;
 
     public static KeyBinding godPlaceKeyBind;
 
-    // static: o comando /gp delay atualiza isso na hora
-    private static volatile int currentGapTicks = 1;
+    private int internalDelayCounter = 0;
+    private int currentGapTicks = 1;
     private boolean gapFlip = false;
-
-    // true se uma colocacao valida (evento nao cancelado) aconteceu neste tick
-    private boolean placedThisTick = false;
-    private long lastFrameAttempt = 0L;
 
     @EventHandler
     public void init(FMLInitializationEvent event) {
@@ -71,15 +64,15 @@ public class FastPlaceMod {
 
         initConfigFile();
         loadSettings();
-        currentGapTicks = baseGap();
     }
 
-    // ==================== REFLECTION (NO PRIMEIRO TICK) ====================
+    // ==================== SAFE FIELD SEARCH (ON FIRST TICK) ====================
     private boolean fieldsInitialized = false;
 
     private void initFieldsSafely() {
         if (fieldsInitialized || mc.thePlayer == null) return;
 
+        // RIGHT CLICK DELAY
         String[] rightClickNames = { "rightClickDelayTimer", "field_71467_ac" };
         for (String name : rightClickNames) {
             try {
@@ -91,53 +84,15 @@ public class FastPlaceMod {
             } catch (Exception ignored) {}
         }
 
-        String[] methodNames = { "rightClickMouse", "func_147121_ag" };
-        for (String name : methodNames) {
-            try {
-                Method m = Minecraft.class.getDeclaredMethod(name);
-                m.setAccessible(true);
-                rightClickMethod = m;
-                System.out.println("[GodPlace] Found rightClickMouse: " + name);
-                break;
-            } catch (Exception ignored) {}
-        }
-
-        if (rightClickDelayField == null) {
-            System.err.println("[GodPlace] Delay field NOT found - delay control disabled");
-        }
-        if (rightClickMethod == null) {
-            System.err.println("[GodPlace] rightClickMouse NOT found - per-frame retry disabled");
-        }
-
         fieldsInitialized = true;
     }
 
-    private int getTimer() {
-        try {
-            return rightClickDelayField.getInt(mc);
-        } catch (Exception e) {
-            return 0;
-        }
-    }
-
-    private void setTimer(int value) {
-        try {
-            rightClickDelayField.setInt(mc, value);
-        } catch (Exception e) {
-            System.err.println("[GodPlace] Delay field error: " + e.getMessage());
-        }
-    }
-
-    // ==================== TICK ====================
     @SubscribeEvent
     public void onClientTick(TickEvent.ClientTickEvent event) {
+        if (event.phase != TickEvent.Phase.END) return;
         if (mc.thePlayer == null || mc.theWorld == null) return;
 
-        if (event.phase == TickEvent.Phase.START) {
-            placedThisTick = false;
-            return;
-        }
-
+        // Initialize fields only when player exists
         if (!fieldsInitialized) {
             initFieldsSafely();
         }
@@ -146,11 +101,22 @@ public class FastPlaceMod {
         if (!enabled) {
             locked = false;
             lockedFace = null;
+            voidBelow = false;
+            internalDelayCounter = 0;
             return;
         }
 
+        // Detecta void abaixo do jogador; se houver, solta a trava de face
+        voidBelow = voidUnlock && isVoidBelow();
+        if (voidBelow && locked) {
+            locked = false;
+            lockedFace = null;
+        }
+
         if (rightClickDelayField != null) {
-            manageDelay();
+            manageDelayWithField();
+        } else {
+            manageDelayWithCounter();
         }
 
         // Reset lock on RMB release
@@ -170,11 +136,32 @@ public class FastPlaceMod {
         }
     }
 
-    // Ticks de espera ate a proxima colocacao: delay 0 = 1 tick, delay 3 = 4 ticks (igual ao vanilla).
-    private static int baseGap() {
-        return (delayHalfTicks + 2) / 2;
+    // ==================== VOID DETECTION ====================
+    // Retorna true se NAO existe nenhum bloco abaixo do jogador (em nenhuma das colunas
+    // que a hitbox ocupa), da altura dos pes ate y=0. Em cima de bloco/chao retorna false.
+    private boolean isVoidBelow() {
+        if (mc.thePlayer == null || mc.theWorld == null) return false;
+
+        AxisAlignedBB bb = mc.thePlayer.getEntityBoundingBox();
+        int minX = MathHelper.floor_double(bb.minX);
+        int maxX = MathHelper.floor_double(bb.maxX);
+        int minZ = MathHelper.floor_double(bb.minZ);
+        int maxZ = MathHelper.floor_double(bb.maxZ);
+        int startY = MathHelper.floor_double(bb.minY);
+
+        for (int x = minX; x <= maxX; x++) {
+            for (int z = minZ; z <= maxZ; z++) {
+                for (int y = startY; y >= 0; y--) {
+                    if (!mc.theWorld.isAirBlock(new BlockPos(x, y, z))) {
+                        return false; // achou bloco/chao, nao e void
+                    }
+                }
+            }
+        }
+        return true;
     }
 
+    // Ticks de espera ate a proxima colocacao: delay 0 = 1 tick, delay 3 = 4 ticks (igual ao vanilla).
     // Delays com .5 alternam entre dois valores, entao a media fica no meio.
     private int nextGapTicks() {
         int gapHalf = delayHalfTicks + 2;
@@ -186,55 +173,19 @@ public class FastPlaceMod {
         return gap;
     }
 
-    private void manageDelay() {
-        int current = getTimer();
-        if (current <= currentGapTicks) return;
-
-        // O vanilla acabou de por o timer em 4 (ou 10). Se com bloco na mao a tentativa
-        // NAO colocou nada (mira no ar / face errada), nao cobra o delay: libera na hora
-        // para o retry (proximo tick ou proximo frame).
-        ItemStack held = mc.thePlayer.getHeldItem();
-        boolean block = held != null && held.getItem() instanceof ItemBlock;
-        boolean holding = mc.gameSettings.keyBindUseItem.isKeyDown();
-
-        if (block && holding && !placedThisTick) {
-            setTimer(0);
-        } else {
-            setTimer(currentGapTicks);
+    private void manageDelayWithField() {
+        try {
+            int current = rightClickDelayField.getInt(mc);
+            if (current > currentGapTicks) {
+                rightClickDelayField.setInt(mc, currentGapTicks);
+            }
+        } catch (Exception e) {
+            System.err.println("[GodPlace] Delay field error: " + e.getMessage());
         }
     }
 
-    // ==================== RETRY POR FRAME ====================
-    // O jogo so tenta colocar no inicio do tick, com a mira do ultimo frame. Se falhou,
-    // aqui a gente tenta de novo no primeiro frame em que a mira estiver valida.
-    @SubscribeEvent
-    public void onRenderTick(TickEvent.RenderTickEvent event) {
-        if (event.phase != TickEvent.Phase.END) return;
-        if (!enabled || rightClickMethod == null || rightClickDelayField == null) return;
-        if (mc.thePlayer == null || mc.theWorld == null) return;
-        if (mc.currentScreen != null || !mc.inGameHasFocus) return;
-        if (!mc.gameSettings.keyBindUseItem.isKeyDown()) return;
-        if (mc.thePlayer.isUsingItem()) return;
-
-        ItemStack held = mc.thePlayer.getHeldItem();
-        if (held == null || !(held.getItem() instanceof ItemBlock)) return;
-
-        if (getTimer() != 0) return;
-
-        MovingObjectPosition mop = mc.objectMouseOver;
-        if (mop == null || mop.typeOfHit != MovingObjectPosition.MovingObjectType.BLOCK) return;
-        if (locked && mop.sideHit != lockedFace) return;
-
-        long now = System.nanoTime();
-        if (now - lastFrameAttempt < FRAME_RETRY_MIN_NANOS) return;
-        lastFrameAttempt = now;
-
-        try {
-            rightClickMethod.invoke(mc);
-        } catch (Exception e) {
-            System.err.println("[GodPlace] Frame retry failed: " + e);
-            rightClickMethod = null; // desliga o retry se der erro
-        }
+    private void manageDelayWithCounter() {
+        if (internalDelayCounter > 0) internalDelayCounter--;
     }
 
     // ==================== INSTANT FACE LOCK ====================
@@ -248,21 +199,30 @@ public class FastPlaceMod {
 
         EnumFacing hitFace = event.face;
 
-        if (!locked) {
+        if (voidBelow) {
+            // Void embaixo: sem trava, qualquer face liberada
+            locked = false;
+            lockedFace = null;
+            sendDebug("VOID abaixo: trava desativada");
+        } else if (!locked) {
             locked = true;
             lockedFace = hitFace;
             sendDebug("LOCKED " + hitFace.name().toUpperCase() + " (INSTANT)");
-        } else if (hitFace != lockedFace) {
-            // Face errada: cancela, mas NAO cobra delay - tenta de novo logo.
+        } else {
+            if (hitFace != lockedFace) {
+                event.setCanceled(true);
+                return;
+            }
+        }
+
+        if (rightClickDelayField == null && internalDelayCounter > 0) {
             event.setCanceled(true);
-            if (rightClickDelayField != null) setTimer(0);
             return;
         }
 
-        placedThisTick = true;
         currentGapTicks = nextGapTicks();
-        if (rightClickDelayField != null) {
-            setTimer(currentGapTicks);
+        if (rightClickDelayField == null) {
+            internalDelayCounter = currentGapTicks;
         }
     }
 
@@ -297,6 +257,7 @@ public class FastPlaceMod {
                     case "placementDelay": delayHalfTicks = parseDelayHalf(value); break;
                     case "activationMode": activationMode = value; break;
                     case "debugMode": debugMode = Boolean.parseBoolean(value); break;
+                    case "voidUnlock": voidUnlock = Boolean.parseBoolean(value); break;
                 }
             }
         } catch (Exception e) {
@@ -332,6 +293,7 @@ public class FastPlaceMod {
             writer.write("placementDelay=" + delayText(delayHalfTicks) + "\n");
             writer.write("activationMode=" + activationMode + "\n");
             writer.write("debugMode=" + debugMode + "\n");
+            writer.write("voidUnlock=" + voidUnlock + "\n");
             writer.flush();
         } catch (Exception e) {}
     }
@@ -339,7 +301,7 @@ public class FastPlaceMod {
     // ==================== COMMAND ====================
     public static class GodPlaceCommand extends CommandBase {
         @Override public String getCommandName() { return "gp"; }
-        @Override public String getCommandUsage(ICommandSender s) { return "/gp [delay|mode|debug]"; }
+        @Override public String getCommandUsage(ICommandSender s) { return "/gp [delay|mode|debug|void]"; }
         @Override public java.util.List<String> getCommandAliases() { return Arrays.asList("godplace"); }
         @Override public boolean canCommandSenderUseCommand(ICommandSender s) { return true; }
 
@@ -361,7 +323,6 @@ public class FastPlaceMod {
                     int half = (int) Math.round(d * 2);
                     if (Math.abs(d * 2 - half) < 1e-9 && half >= 0 && half <= 6) {
                         delayHalfTicks = half;
-                        currentGapTicks = baseGap(); // vale ja na proxima colocacao
                         sender.addChatMessage(new ChatComponentText("[GodPlace] \u00a7fDelay: \u00a7e" + delayText(half)));
                         saveSettings();
                     } else {
@@ -391,6 +352,14 @@ public class FastPlaceMod {
                 saveSettings();
             }
 
+            else if ("void".equals(cmd)) {
+                voidUnlock = !voidUnlock;
+                sender.addChatMessage(new ChatComponentText(
+                    "[GodPlace] \u00a7fVoid unlock: " + (voidUnlock ? "\u00a7aON" : "\u00a7cOFF")
+                ));
+                saveSettings();
+            }
+
             else if ("about".equals(cmd)) {
                 sender.addChatMessage(new ChatComponentText(
                     "[GodPlace] \u00a7fA mod designed to help with block placements made by sheep :3"
@@ -399,7 +368,7 @@ public class FastPlaceMod {
 
             else {
                 sender.addChatMessage(new ChatComponentText(
-                    "[GodPlace] \u00a7f/gp, delay, mode, debug, about"
+                    "[GodPlace] \u00a7f/gp, delay, mode, debug, void, about"
                 ));
             }
         }
